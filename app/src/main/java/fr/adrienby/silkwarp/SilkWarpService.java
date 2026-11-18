@@ -11,6 +11,7 @@ import android.opengl.GLES30;
 import android.opengl.GLSurfaceView;
 import android.opengl.GLUtils;
 import android.os.Build;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
@@ -60,7 +61,26 @@ public class SilkWarpService extends WallpaperService {
         private volatile float offset = 0.5f;    // launcher wallpaper offset
         private volatile boolean visible = false;
         private volatile int gen = 0;            // bumps on every kick, guards going idle
+        private volatile boolean startKick = false; // give the spring a push on its first frame
         private boolean receiverOn = false;
+        private long lastUnlockMs = -100_000;
+
+        // System messages the framework sends to the active wallpaper engine (hidden constants
+        // in WallpaperManager). "keyguardgoingaway" arrives the instant the lock screen starts
+        // dismissing — i.e. right when the fingerprint is accepted.
+        private static final String CMD_KEYGUARD_GOING_AWAY = "android.wallpaper.keyguardgoingaway";
+        private static final String CMD_KEYGUARD_APPEARING = "android.wallpaper.keyguardappearing";
+        private static final String CMD_WAKING_UP = "android.wallpaper.wakingup";
+        private static final String CMD_GOING_TO_SLEEP = "android.wallpaper.goingtosleep";
+
+        /** Backup for ROMs that don't send the command: check the keyguard every frame while it shows. */
+        private final Runnable poll = new Runnable() {
+            @Override public void run() {
+                if (!visible || isPreview() || targetP > 0.5f || keyguard == null) return;
+                if (!keyguard.isKeyguardLocked()) { unlock(); return; }
+                main.postDelayed(this, 16);
+            }
+        };
 
         // GL-thread state
         private float p = 1f, pv = 0f;
@@ -79,7 +99,7 @@ public class SilkWarpService extends WallpaperService {
                     unlock();
                 } else if (Intent.ACTION_SCREEN_ON.equals(a)) {
                     if (keyguard != null && !keyguard.isKeyguardLocked()) unlock();
-                    else kick();
+                    else { kick(); startPolling(); }
                 }
             }
         };
@@ -139,10 +159,12 @@ public class SilkWarpService extends WallpaperService {
             if (v) {
                 view.onResume();
                 if (!isPreview() && keyguard != null) {
-                    if (keyguard.isKeyguardLocked()) {
+                    boolean justUnlocked = SystemClock.uptimeMillis() - lastUnlockMs < 1500;
+                    if (keyguard.isKeyguardLocked() && !justUnlocked) {
                         snapToLock = true; targetP = 0f;
+                        startPolling();
                     } else if (targetP < 0.5f) {
-                        targetP = 1f;          // became visible on home while still in lock state
+                        unlock();              // became visible on home while still in lock state
                     }
                 }
                 kick();
@@ -166,15 +188,52 @@ public class SilkWarpService extends WallpaperService {
             }
         }
 
+        @Override
+        public Bundle onCommand(String action, int x, int y, int z, Bundle extras, boolean resultRequested) {
+            if (!isPreview() && action != null) {
+                switch (action) {
+                    case CMD_KEYGUARD_GOING_AWAY:
+                        unlock();
+                        break;
+                    case CMD_KEYGUARD_APPEARING:
+                    case CMD_GOING_TO_SLEEP:
+                        lockNow();
+                        break;
+                    case CMD_WAKING_UP:
+                        // fingerprint from screen-off: the keyguard may already be gone
+                        if (keyguard != null && !keyguard.isKeyguardLocked()) unlock();
+                        else startPolling();
+                        break;
+                    default:
+                        break;
+                }
+            }
+            return super.onCommand(action, x, y, z, extras, resultRequested);
+        }
+
         // ---- main-thread helpers ----
         private void kick() {
             gen++;
             if (view != null) view.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
         }
-        private void unlock() { targetP = 1f; kick(); }
+        private void unlock() {
+            if (targetP < 0.5f) {
+                lastUnlockMs = SystemClock.uptimeMillis();
+                startKick = true;
+                targetP = 1f;
+            }
+            main.removeCallbacks(poll);
+            kick();
+        }
+        private void startPolling() {
+            main.removeCallbacks(poll);
+            main.post(poll);
+        }
         private void lockNow() {
             snapToLock = true; targetP = 0f;
+            lastUnlockMs = -100_000;
             if (view != null) view.requestRender();
+            if (visible) { kick(); startPolling(); }
         }
 
         // ---- renderer (GL thread) ----
@@ -229,6 +288,7 @@ public class SilkWarpService extends WallpaperService {
 
             if (snapToLock) { snapToLock = false; p = 0f; pv = 0f; }
             float tgt = targetP;
+            if (startKick) { startKick = false; if (tgt > 0.5f && p < 0.5f) pv = Math.max(pv, 1.4f); }
 
             // damped spring, same constants as the prototype
             float k = 95f * SPEED * SPEED, c = 2f * 0.68f * (float) Math.sqrt(k);
